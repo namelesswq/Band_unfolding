@@ -9,8 +9,8 @@ Features:
  - If multiple HSP indices map to almost-identical x positions, they are merged and label shown as "A|L"
  - fatband: uniform color; alpha & size ~ weight
  - density: weighted 2D histogram (viridis default)
- - supports --ylim, --hsp, --ef (Fermi level), and other options
- - NEW: --vmin/--vmax for density colormap limits, --smooth-sigma for optional Gaussian smoothing
+ - supports --ylim, --hsp, --ef (主数据 Fermi), --ef-overlay (overlay bands Fermi)
+ - supports --vmin/--vmax, --smooth-sigma
 """
 import argparse
 from pathlib import Path
@@ -35,24 +35,18 @@ def gaussian_smooth(arr: np.ndarray, sigma: float) -> np.ndarray:
         return gaussian_filter(arr, sigma=sigma)
     except Exception:
         # Pure numpy separable convolution
-        # build 1D kernel truncated at 3 sigma each side (size = 6*sigma rounded up, odd)
         sigma = float(sigma)
         radius = max(1, int(np.ceil(3.0 * sigma)))
         x = np.arange(-radius, radius + 1)
         kernel = np.exp(-0.5 * (x / sigma) ** 2)
         kernel /= kernel.sum()
-        # convolve rows then cols
-        # pad array using reflect to reduce border effects
         padded = np.pad(arr, ((radius, radius), (radius, radius)), mode='reflect')
-        # convolve along axis 1 (cols) for each row
         tmp = np.empty_like(padded, dtype=float)
         for i in range(padded.shape[0]):
             tmp[i, :] = np.convolve(padded[i, :], kernel, mode='same')
-        # then convolve along axis 0 (rows)
         out_padded = np.empty_like(tmp, dtype=float)
         for j in range(tmp.shape[1]):
             out_padded[:, j] = np.convolve(tmp[:, j], kernel, mode='same')
-        # crop back
         out = out_padded[radius:-radius, radius:-radius]
         return out
 
@@ -216,7 +210,7 @@ def plot_fatband_fixedcolor(xs_sorted, ys_sorted, ws_sorted,
             ax.set_xticklabels(labels, fontsize=9)
 
     ax.set_xlabel('k (path coord)')
-    ax.set_ylabel('Energy')
+    ax.set_ylabel('Energy (relative to E_F)')
     ax.set_title('Fatband (uniform color; alpha & size ~ weight)')
     ax.grid(True, linestyle=':', alpha=0.4)
 
@@ -260,7 +254,6 @@ def plot_density(xs_sorted, ys_sorted, ws_sorted,
                                          weights=ws_sorted)
     disp = np.log1p(H) if log_scale else H
 
-    # optional smoothing (on disp)
     if smooth_sigma and smooth_sigma > 0.0:
         disp = gaussian_smooth(disp, smooth_sigma)
 
@@ -275,7 +268,7 @@ def plot_density(xs_sorted, ys_sorted, ws_sorted,
             ax.set_xticklabels(labels, fontsize=9)
 
     ax.set_xlabel('k (path coord)')
-    ax.set_ylabel('Energy')
+    ax.set_ylabel('Energy (relative to E_F)')
     ax.set_title('Density (weighted)')
     if y_lim is not None:
         ax.set_ylim(y_lim)
@@ -287,6 +280,64 @@ def plot_density(xs_sorted, ys_sorted, ws_sorted,
     ax.xaxis.set_label_position('bottom')
 
     return fig, ax, (k_edges, e_edges, H, disp)
+
+# -------------------------
+# 读取 bands.out.gnu（支持空行分段）
+# 返回 list of segments, each segment is (k_array, e_array)
+# -------------------------
+def read_bands_gnu(path: Path):
+    segments = []
+    ks = []
+    es = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                if ks:
+                    segments.append((np.array(ks, dtype=float), np.array(es, dtype=float)))
+                    ks = []; es = []
+                continue
+            toks = line.split()
+            if toks[0].startswith('#'):
+                continue
+            try:
+                k = float(toks[0])
+                e = float(toks[1])
+            except Exception:
+                continue
+            ks.append(k); es.append(e)
+    if ks:
+        segments.append((np.array(ks, dtype=float), np.array(es, dtype=float)))
+    return segments
+
+# -------------------------
+# 叠加绘制折线（自动把 bands 的 k 缩放到 target_kmin/kmax）
+# segments: list of (k_arr, e_arr)
+# ax: 目标坐标轴
+# -------------------------
+def overlay_bands_lines(ax, segments, target_kmin, target_kmax,
+                        color='k', lw=0.8, alpha=1.0, zorder=10, ef_overlay: Optional[float]=None):
+    if not segments:
+        return
+    # find bands k global range (ignore segments with constant single point)
+    all_k = np.hstack([seg[0] for seg in segments if seg[0].size > 0])
+    if all_k.size == 0:
+        return
+    src_kmin = float(np.min(all_k)); src_kmax = float(np.max(all_k))
+    if abs(src_kmax - src_kmin) < 1e-12:
+        src_kmin -= 0.5; src_kmax += 0.5
+
+    def rescale_k(k):
+        return (k - src_kmin) / (src_kmax - src_kmin) * (target_kmax - target_kmin) + target_kmin
+
+    for k_arr, e_arr in segments:
+        if k_arr.size == 0:
+            continue
+        k_res = rescale_k(k_arr)
+        e_plot = e_arr.copy()
+        if ef_overlay is not None:
+            e_plot = e_plot - float(ef_overlay)  # shift overlay energies relative to its E_F
+        ax.plot(k_res, e_plot, color=color, linewidth=lw, alpha=alpha, zorder=zorder)
 
 # -------------------------
 # CLI & main
@@ -301,7 +352,7 @@ def main():
     p.add_argument('--size-max', type=float, default=120.0)
     p.add_argument('--alpha-min', type=float, default=0.06)
     p.add_argument('--alpha-max', type=float, default=1.0)
-    p.add_argument('--ylim', nargs=2, type=float, metavar=('YMIN','YMAX'), help='y-axis limits (energy)')
+    p.add_argument('--ylim', nargs=2, type=float, metavar=('YMIN','YMAX'), help='y-axis limits (energy) - after shifting by EF')
     p.add_argument('--bins-k', type=int, default=300)
     p.add_argument('--bins-e', type=int, default=400)
     p.add_argument('--log', action='store_true', help='log1p display for density')
@@ -310,7 +361,13 @@ def main():
     p.add_argument('--vmax', type=float, default=None, help='vmax for density colormap')
     p.add_argument('--smooth-sigma', type=float, default=0.0, help='Gaussian smoothing sigma (pixels) for density')
     p.add_argument('--hsp', type=str, default=None, help='HSP list: "GAMMA:0,X:49,..." (indices are k-index if present, else 0-based row-index)')
-    p.add_argument('--ef', '--fermi', dest='ef', type=float, default=None, help='Fermi energy (draw horizontal dashed line at this energy)')
+    p.add_argument('--ef', '--ef-main', dest='ef_main', type=float, default=None, help='Fermi energy for main data (subtract from main energies)')
+    p.add_argument('--ef-overlay', dest='ef_overlay', type=float, default=None, help='Fermi energy for overlay bands (subtract from overlay energies)')
+    p.add_argument('--overlay-bands', type=str, default=None, help='overlay band lines from gnu file (bands.out.gnu)')
+    p.add_argument('--overlay-color', type=str, default='k', help='color for overlay band lines')
+    p.add_argument('--overlay-lw', type=float, default=0.8, help='linewidth for overlay band lines')
+    p.add_argument('--overlay-alpha', type=float, default=1.0, help='alpha for overlay band lines')
+
     args = p.parse_args()
 
     infile = Path(args.file)
@@ -318,6 +375,11 @@ def main():
     if xs_orig.size == 0:
         raise RuntimeError("No numeric data parsed from file.")
 
+    # shift main energies by main EF if provided (make energies relative to E_F)
+    if args.ef_main is not None:
+        ys_orig = ys_orig - float(args.ef_main)
+
+    # For plotting we sort by k then energy to make scatter/density neat, but keep original arrays for HSP indexing.
     order = np.lexsort((ys_orig, xs_orig))
     xs_sorted = xs_orig[order]; ys_sorted = ys_orig[order]; ws_sorted = ws_orig[order]
 
@@ -345,12 +407,24 @@ def main():
                                   y_lim=y_lim, vmin=args.vmin, vmax=args.vmax,
                                   smooth_sigma=args.smooth_sigma)
 
-    # draw Fermi level line if requested
-    if args.ef is not None:
-        ef = float(args.ef)
-        ax.axhline(y=ef, color='k', linestyle='--', linewidth=1.0, alpha=0.9)
+    # if ef_main provided, draw horizontal y=0 line (E - E_F = 0)
+    if args.ef_main is not None:
+        ax.axhline(y=0.0, color='k', linestyle='--', linewidth=1.0, alpha=0.9)
         trans = ax.get_yaxis_transform()
-        ax.text(1.01, ef, f'E_F={ef}', transform=trans, ha='left', va='center', fontsize=9, clip_on=False)
+        ax.text(1.01, 0.0, 'E_F=0', transform=trans, ha='left', va='center', fontsize=9, clip_on=False)
+
+    # overlay bands lines if requested (apply overlay EF shift if provided)
+    if args.overlay_bands:
+        bands_path = Path(args.overlay_bands)
+        if bands_path.exists():
+            segments = read_bands_gnu(bands_path)
+            kmin_target = float(np.nanmin(xs_sorted))
+            kmax_target = float(np.nanmax(xs_sorted))
+            overlay_bands_lines(ax, segments, kmin_target, kmax_target,
+                                color=args.overlay_color, lw=args.overlay_lw,
+                                alpha=args.overlay_alpha, zorder=12, ef_overlay=args.ef_overlay)
+        else:
+            print(f"[WARN] overlay bands file not found: {bands_path}")
 
     plt.tight_layout(pad=0.5)
     if args.out:
